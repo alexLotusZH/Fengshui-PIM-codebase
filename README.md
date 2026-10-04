@@ -71,6 +71,15 @@ bash generate_figures.sh
 After completing this step, CSV and PDF files for Figures 11–14 will be generated in the `figures` and `figure_source_data` directories. The figures in the published paper were created using `cent_simulation/Figures.xlsx` Excel file.
 To reproduce the figures in the same format as those in the paper, copy the content of the generated CSV files into the `Data` sheet of the Excel file. The figures will then be generated in the `Figures` sheet.
 
+### Configurations
+
+PIM: In 'run_sim.py', 'function_sim.py', 'utils.py'
+
+Llama: Llama.py, Llama3_1.py
+
+Energy Calculation Metrics: run_sim.py, cent_power_calculator.py
+
+
 ### Figure 12
 
 The CXL controller costs are broken down into die, packaging and Non Recurring Engineering (NRE) components. The die cost is derived from the wafer cost, considering the CXL controller die area and yield rate. The cost of 2D packaging is assumed to be 29% of chip cost (die and package). The NRE cost is influenced by chip production volumes.
@@ -139,3 +148,4 @@ This repository is available under a [MIT license](/LICENSE).
 ## Acknowledgement
 
 This work was supported in part by the NSF under the CAREER-1652294 and NSF-1908601 awards and by Intel gift.
+

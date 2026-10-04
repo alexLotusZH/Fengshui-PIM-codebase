@@ -59,6 +59,7 @@ def gpt_latency(size, PCIe_lanes_per_device, devices, total_devices):
 
         total_latency = embedding_broadcast_latency * 4 + embedding_gather_latency * 5 + embedding_broadcast_latency * 1 +  ffn_gather_latency * 1
         print(total_latency)
+        return total_latency
 
 def vector_latency(size, PCIe_lanes_per_device):
     bandwidth_per_device = PCIe_lanes_per_device * bandwidth_per_lane
@@ -91,7 +92,7 @@ def get_args():
     parser.add_argument("--pipeline-parallel", action="store_true")
     parser.add_argument("--model-parallel", action="store_true")
     parser.add_argument("--embedding", action="store_true")
-    parser.add_argument("--model", choices=["Llama-7B", "Llama-13B", "Llama-70B", "GPT3-175B", "GPT3-175B-TP-8", "OPT-66B"], help="model choice")
+    parser.add_argument("--model", choices=["Llama-7B", "Llama-13B", "Llama-70B", "GPT3-175B","Llama31-8B","Llama31-70B","Qwen3-30B-A3B", "Qwen3-235B-A22B", "GPT3-175B-TP-8", "OPT-66B"], help="model choice")
     parser.add_argument("--num-devices", type=int, help="total devices")
     parser.add_argument("--group-devices", type=int, help="group devices in hybrid parallel")
     parser.add_argument("--PCIe-lanes", type=int, help="per device")

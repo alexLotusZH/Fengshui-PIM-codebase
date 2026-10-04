@@ -1,4 +1,19 @@
+# Python
 __pycache__/
-*.pyc
-tmp.log
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Logs
+*.log
 logs.txt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+~$*
+
+# Simulation outputs
+cent_simulation/*.csv

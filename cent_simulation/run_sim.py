@@ -16,7 +16,7 @@ def get_args():
     parser.add_argument("--reuse_size", type=int, help="GB reuse size, depending on register number", default=32)
     parser.add_argument("--generate_trace_max_workers", type=int, help="maximum concurrent threads to generate traces, limited by memory", default=20)
     parser.add_argument("--run_simulation_max_workers", type=int, help="maximum concurrent threads to generate traces, limited by memory", default=4)
-    parser.add_argument("--model", choices=["Llama2-7B", "Llama2-13B", "Llama2-70B"], help="LLM Model", required=True)
+    parser.add_argument("--model", choices=["Llama2-7B", "Llama2-13B", "Llama2-70B", "OPT-66B", "Llama31-8B", "Llama31-70B", "Qwen3-30B-A3B", "Qwen3-235B-A22B","ViT-B16", "ViT-H14", "ViT-L16"], help="LLM Model", required=True)
     parser.add_argument("--generate_trace", action="store_true", help="Generate traces")
     parser.add_argument("--simulate_trace", action="store_true", help="Simulate traces")
     parser.add_argument("--process_results", action="store_true", help="Process results")
@@ -31,6 +31,22 @@ def get_args():
     parser.add_argument("--seqlen_gap", type=int, help="Gap between sequence lengths", default=128)
     parser.add_argument("--model_parallel", action="store_true", help="Apply model parallelism")
     parser.add_argument("--inter-device-attention", action="store_true")
+    parser.add_argument("--operator", choices=[
+        "trace_rms",
+        "trace_qkv_proj",
+        "trace_rope",
+        "trace_attn_score",
+        "trace_attn_mask",
+        "trace_attn_softmax",
+        "trace_attn_o",
+        "trace_wo_proj",
+        "trace_router",
+        "trace_w1_proj",
+        "trace_w3_proj",
+        "trace_ffn_af",
+        "trace_w2_proj",
+        "all"
+    ], default="all")
     args = parser.parse_args()
     return args
 
@@ -50,40 +66,43 @@ def generate_trace(args, seqlen_list):
 
     if args.model == "GPT3-175B":
         model = "--GPT3-175B"
-    elif args.model == "Llama2-70B" or "Llama3" in args.model:
+    elif args.model == "Llama2-70B" or "Llama3" in args.model or "Qwen3" in args.model:
         model = "--Llama-GQA"
-    elif "Llama2" in args.model:
+    elif "Llama2" in args.model or "ViT" in args.model:
         model = "--Llama"
+    elif args.model == "OPT-66B":
+        model = "--OPT-66B"
+
 
     commands_generate_traces = []
     blocks_per_device = (TransformerBlock_number[args.model] - 1) // args.num_devices + 1
     channels_per_block = args.num_channels // blocks_per_device
     FC_devices_list = factorize(args.num_devices)
-
+    operator = args.operator
     # Embedding
     seqlen = args.prefill + args.decoding
     if args.model_parallel:
         for FC_devices in FC_devices_list:
             if not os.path.exists(f"../trace/{args.num_channels}_channels_per_device/model_parallel_embedding/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"):
-                commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--embedding", "--only-trace", "--num-channels", str(args.num_channels), "--FC-devices", str(FC_devices), "--model-parallel", "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/model_parallel_embedding/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"])
+                commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--embedding", "--only-trace", "--num-channels", str(args.num_channels), "--FC-devices", str(FC_devices), "--model-parallel", "--operator", str(operator), "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/model_parallel_embedding/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"])
     else:
         if not os.path.exists(f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel_embedding/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{seqlen}.txt"):
-            commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--embedding", "--only-trace", "--num-channels", str(args.num_channels), "--channels-per-block", str(channels_per_block), "--pipeline-parallel", "--multi-tb-per-device", "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel_embedding/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{seqlen}.txt"])
+            commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--embedding", "--only-trace", "--num-channels", str(args.num_channels), "--channels-per-block", str(channels_per_block), "--pipeline-parallel", "--multi-tb-per-device", "--operator", str(operator), "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel_embedding/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{seqlen}.txt"])
 
     for seqlen in seqlen_list:
         if args.model_parallel:          
             for FC_devices in FC_devices_list:
                 if not os.path.exists(f"../trace/{args.num_channels}_channels_per_device/model_parallel/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"):
-                    commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--only-trace", "--num-channels", str(args.num_channels), "--FC-devices", str(FC_devices), "--model-parallel", "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/model_parallel/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"])
+                    commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--only-trace", "--num-channels", str(args.num_channels), "--FC-devices", str(FC_devices), "--model-parallel", "--operator", str(operator), "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/model_parallel/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"])
                     if args.inter_device_attention:
                         commands_generate_traces[-1].append("--inter-device-attention")
                 if not os.path.exists(f"../trace/{args.num_channels}_channels_per_device/model_parallel_FC/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"):
-                    commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--only-FC", "--only-trace", "--num-channels", str(args.num_channels), "--FC-devices", str(FC_devices), "--model-parallel", "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/model_parallel_FC/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"])
+                    commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--only-FC", "--only-trace", "--num-channels", str(args.num_channels), "--FC-devices", str(FC_devices), "--model-parallel", "--operator", str(operator), "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/model_parallel_FC/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt"])
         else:
             if channels_per_block < minimal_channel_per_block[args.model]:
                 raise ValueError(f"Channels per block {channels_per_block} is less than minimal channel per block {minimal_channel_per_block[args.model]}")
             if not os.path.exists(f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{seqlen}.txt"):
-                commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--only-trace", "--num-channels", str(args.num_channels), "--channels-per-block", str(channels_per_block), "--pipeline-parallel", "--multi-tb-per-device", "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{seqlen}.txt"])
+                commands_generate_traces.append(["python3", "function_sim.py", model, "--n_heads", str(n_heads[args.model]), "--ffn_dim", str(ffn_size[args.model]), "--only-trace", "--num-channels", str(args.num_channels), "--channels-per-block", str(channels_per_block), "--pipeline-parallel", "--multi-tb-per-device", "--operator", str(operator), "--seqlen", str(seqlen), "--op-trace", "--GEMV", "reuse-GB", "--reuse-size", str(args.reuse_size), "--trace-file", f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{seqlen}.txt"])
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.generate_trace_max_workers) as executor:
         futures = [executor.submit(subprocess.run, cmd) for cmd in commands_generate_traces]
@@ -167,19 +186,33 @@ def process_results(args):
             compiled_results_file.write(result.stderr)
 
 def calculate_acc_latency(args, seqlen):
+    # Flags for testing rms, softmax and rope
+    RMS_flag = args.operator == "trace_rms" or not args.operator 
+    Softmax_flag = args.operator == "trace_attn_softmax" or not args.operator    
+    RoPE_flag = args.operator == "trace_rope" or not args.operator 
+
     latency = {}
     GQA_factor = 1.00 + 1.00 / gqa_factor[args.model]
-    latency["RMSNorm_latency"] =  embedding_size[args.model] / 16.00 / 16.00 / args.num_channels * ACCEL_CYCLE["VEC"]    # EMB /16.00 /16.00 ADD
-    latency["RMSNorm_latency"] += SB_RD_CYCLE + SB_WR_CYCLE + 1.00                              # 1 RED
-    latency["RMSNorm_latency"] += RV_RMSNorm_CYCLE                                              # 1 RISCV
-    latency["RMSNorm_latency"] = float(2.00 * latency["RMSNorm_latency"]) / float(FREQ / KILO)
-    latency["Softmax_latency"] =  seqlen * n_heads[args.model] / 16.00 / args.num_channels * ACCEL_CYCLE["EXP"]        # TOK*HEAD /16.00 EXP
-    latency["Softmax_latency"] += seqlen * n_heads[args.model] / 16.00 / args.num_channels * ACCEL_CYCLE["VEC"]        # TOK*HEAD /16.00 ADD
-    latency["Softmax_latency"] += n_heads[args.model] * 1.00 * SB_RD_CYCLE                                     # HEAD RED
-    latency["Softmax_latency"] += n_heads[args.model] * RV_SFT_CYCLE_PIPELINE                                  # HEAD RISCV
-    latency["Softmax_latency"] = float(latency["Softmax_latency"]) / float(FREQ / KILO)
-    latency["RotEmbed_latency"] = embedding_size[args.model] * RV_ROTEmbed_CYCLE                                 # EMB RISCV
-    latency["RotEmbed_latency"] = float(GQA_factor * latency["RotEmbed_latency"]) / float(FREQ / KILO)
+    latency["RMSNorm_latency"] = 0
+    latency["Softmax_latency"] = 0
+    latency["RotEmbed_latency"] = 0
+
+    if RMS_flag:
+        latency["RMSNorm_latency"] =  embedding_size[args.model] / 16.00 / 16.00 / args.num_channels * ACCEL_CYCLE["VEC"]    # EMB /16.00 /16.00 ADD
+        latency["RMSNorm_latency"] += SB_RD_CYCLE + SB_WR_CYCLE + 1.00                              # 1 RED
+        latency["RMSNorm_latency"] += RV_RMSNorm_CYCLE                                              # 1 RISCV
+        latency["RMSNorm_latency"] = float(2.00 * latency["RMSNorm_latency"]) / float(FREQ / KILO)
+    
+    if Softmax_flag:
+        latency["Softmax_latency"] =  seqlen * n_heads[args.model] / 16.00 / args.num_channels * ACCEL_CYCLE["EXP"]        # TOK*HEAD /16.00 EXP
+        latency["Softmax_latency"] += seqlen * n_heads[args.model] / 16.00 / args.num_channels * ACCEL_CYCLE["VEC"]        # TOK*HEAD /16.00 ADD
+        latency["Softmax_latency"] += n_heads[args.model] * 1.00 * SB_RD_CYCLE                                     # HEAD RED
+        latency["Softmax_latency"] += n_heads[args.model] * RV_SFT_CYCLE_PIPELINE                                  # HEAD RISCV
+        latency["Softmax_latency"] = float(latency["Softmax_latency"]) / float(FREQ / KILO)
+    
+    if RoPE_flag:
+        latency["RotEmbed_latency"] = embedding_size[args.model] * RV_ROTEmbed_CYCLE                                 # EMB RISCV
+        latency["RotEmbed_latency"] = float(GQA_factor * latency["RotEmbed_latency"]) / float(FREQ / KILO)
     return latency
 
 def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per_device, blocks_per_device, embedding_latency, utilized_devices, pp, tp):
@@ -202,6 +235,10 @@ def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per
         embedding_latency_data = embedding_latency['pipeline_parallel'][channels_per_block]
     acc_latency_dict = calculate_acc_latency(args, seqlen)
     acc_latency = (acc_latency_dict["RMSNorm_latency"] + acc_latency_dict["Softmax_latency"] + acc_latency_dict["RotEmbed_latency"]) * blocks_per_device
+   
+   
+    print(f"model:{args.model}, acc_latency:{acc_latency}, cxl_latency:{cxl_latency}, pim_latency:{pim_latency}")
+    
     transformer_block_latency = pim_latency + cxl_latency + acc_latency
     token_latency = transformer_block_latency * TransformerBlock_number[args.model] + embedding_latency_data + InOut_latency
     throughput = 1000 / token_latency * pp
@@ -209,25 +246,32 @@ def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per
     energy_token = {}
     power_alldv = {}
     PCIE = embedding_size[args.model] * 10 + ffn_size[args.model] * 2 if args.model_parallel else embedding_size[args.model]
-    energy_main, latency_main = power_calculator(stats, PCIE, n_heads[args.model], embedding_size[args.model], seqlen, gqa_factor[args.model])
+    energy_main, latency_main = power_calculator(stats, PCIE, n_heads[args.model], embedding_size[args.model], seqlen, gqa_factor[args.model], args.operator)
     if args.model_parallel:
         pipeline_stages = args.num_devices // FC_devices
         FC_path = f"../trace/{args.num_channels}_channels_per_device/model_parallel_FC/{args.model}/trace_{FC_devices}_FC_devices_seqlen_{seqlen}.txt.log"
         stats_FC = command_processor(FC_path)
-        energy_FC, latency_FC = power_calculator(stats_FC, PCIE, n_heads[args.model], embedding_size[args.model], seqlen, gqa_factor[args.model])
+        energy_FC, latency_FC = power_calculator(stats_FC, PCIE, n_heads[args.model], embedding_size[args.model], seqlen, gqa_factor[args.model], args.operator)
         for comp in energy_main.keys():
             energy_token[comp] = (energy_main[comp] + energy_FC[comp] * (FC_devices - 1)) * TransformerBlock_number[args.model]
-            power_alldv[comp] = (energy_main[comp] + energy_FC[comp] * (FC_devices - 1)) * pipeline_stages / stats["latency"]
+            power_alldv[comp] = (energy_main[comp] + energy_FC[comp] * (FC_devices - 1)) * pipeline_stages / (stats["latency"] + latency_main["RMSNorm_latency"] + latency_main["Softmax_latency"] + latency_main["RotEmbed_latency"] + latency_FC["RMSNorm_latency"] + latency_FC["Softmax_latency"] + latency_FC["RotEmbed_latency"])
     else:
         for comp in energy_main.keys():
             energy_token[comp] = energy_main[comp] * utilized_devices
-            power_alldv[comp] = energy_main[comp] * utilized_devices / stats["latency"]
+            power_alldv[comp] = energy_main[comp] * utilized_devices / (stats["latency"] + latency_main["RMSNorm_latency"] + latency_main["Softmax_latency"] + latency_main["RotEmbed_latency"])
     total_energy = 0
     for comp in energy_token.keys():
         total_energy += energy_token[comp]
     total_power = 0
     for comp in power_alldv.keys():
         total_power += power_alldv[comp]
+
+    static_keys = ["GB_STT", "SB_STT", "IB_STT", "RED_STT", "EXP_STT", "VEC_STT", "ACT_STBY", "PRE_STBY"]
+    energy_token["static"] = sum(energy_token.get(k, 0.0) for k in static_keys)
+    energy_token["dynamic"] = total_energy - energy_token["static"]
+    power_alldv["static"] = sum(power_alldv.get(k, 0.0) for k in static_keys)
+    power_alldv["dynamic"] = total_power - power_alldv["static"]
+
     device_utilization = 1.0 * utilized_devices / args.num_devices
                         
     new_result = {
@@ -238,15 +282,17 @@ def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per
         'Channels per device': args.num_channels,
         'Channels per block': channels_per_block,
         'Sequence length': seqlen,
+        'Token latency (ms)': token_latency,
+        'Token energy (mJ)': total_energy,
+        'Total power (W)': total_power,
+        'Static Power (W)': power_alldv["static"],
+        'Dynamic Power (W)': power_alldv["dynamic"],
+        'Throughput (tokens/s)': throughput,
         'PIM latency': pim_latency,
         'CXL latency': cxl_latency,
         'Acc latency': acc_latency,
         'TransformerBlock latency': transformer_block_latency,
         'Embedding latency': embedding_latency_data,
-        'Token latency (ms)': token_latency,
-        'Throughput (tokens/s)': throughput,
-        'Token energy (mJ)': total_energy,
-        'Total power (W)': total_power,
         'Device utilization': device_utilization
     }
     new_result_df = pd.DataFrame([new_result])
@@ -327,9 +373,11 @@ def process_throughputs(args):
     if os.path.exists(args.processed_result_path):
         results_df = pd.read_csv(args.processed_result_path)
     else:
-        columns = ['Model', 'Device number', 'Seqlen', 'Pipeline parallelism', 'Tensor parallelism', 'Phase', 'Total Latency (s)', 'Throughput (tokens/s)', 'Energy per Token (mJ)', 'Total power (W)']
+        columns = ['Model', 'Device number', 'Seqlen', 'Pipeline parallelism', 'Tensor parallelism', 'Phase','Total Transformer Latency (ms)', 'Static Power (W)', 'Dynamic Power (W)', 'Total Latency (s)', 'Throughput (tokens/s)', 'Energy per Token (mJ)', 'Total power (W)']
         results_df = pd.DataFrame(columns=columns)
 
+    print("df_simulation\n", df_simulation)
+    print("results_df\n", results_df)
 
     if args.model_parallel:
 
@@ -356,7 +404,9 @@ def process_throughputs(args):
             average_energy = df['Token energy (mJ)'].mean()
             total_latency = df['Token latency (ms)'].mean() * seqlen / 1000
             total_power = df['Total power (W)'].mean()
-
+            total_transformer_latency = df['TransformerBlock latency'].mean() * seqlen 
+            total_static_power = df['Static Power (W)'].mean()
+            total_dynamic_power = df['Dynamic Power (W)'].mean()
             new_result = {
                 'Model': args.model,
                 'Device number': args.num_devices,
@@ -367,14 +417,19 @@ def process_throughputs(args):
                 'Total Latency (s)': total_latency,
                 'Throughput (tokens/s)': average_throughput,
                 'Energy per Token (mJ)': average_energy,
-                'Total power (W)': total_power
+                'Total energy (mJ)': average_energy * seqlen,
+                'Total power (W)': total_power,
+                'Total Transformer Latency (ms)': total_transformer_latency,
+                'Static Power (W)': total_static_power,
+                'Dynamic Power (W)': total_dynamic_power
+
             }
             new_result_df = pd.DataFrame([new_result])
             results_df = pd.concat([results_df, new_result_df], ignore_index=True)
 
     else:
-
-        df = df_simulation[(df_simulation['Model'] == args.model) & (df_simulation['Pipeline parallelism'] == TransformerBlock_number[args.model]) & (df_simulation['Tensor parallelism'] == 1)]
+        # df = df_simulation[(df_simulation['Model'] == args.model) & (df_simulation['Pipeline parallelism'] == TransformerBlock_number[args.model]) & (df_simulation['Tensor parallelism'] == 1)]
+        df = df_simulation[(df_simulation['Model'] == args.model) & (df_simulation['Tensor parallelism'] == 1)]
 
         if args.phase == "prefill":
             df = df[(df['Sequence length'] <= args.prefill)]
@@ -390,6 +445,8 @@ def process_throughputs(args):
         average_energy = df['Token energy (mJ)'].mean()
         total_latency = df['Token latency (ms)'].mean() * seqlen / 1000
         total_power = df['Total power (W)'].mean()
+            
+        print("df", df)
 
         new_result = {
             'Model': args.model,
@@ -401,6 +458,7 @@ def process_throughputs(args):
             'Total Latency (s)': total_latency,
             'Throughput (tokens/s)': average_throughput,
             'Energy per Token (mJ)': average_energy,
+            'Total energy (mJ)': average_energy * seqlen,
             'Total power (W)': total_power
         }
         new_result_df = pd.DataFrame([new_result])

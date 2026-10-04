@@ -5,24 +5,114 @@ import argparse
 debug = False
 
 InOut_latency = 0.15        # Top-K sampling on CPU
-n_heads = {"Llama2-7B": 32, "Llama2-13B": 40, "Llama2-70B": 64}
-gqa_factor = {"Llama2-7B": 1, "Llama2-13B": 1, "Llama2-70B": 8}
-embedding_size = {"Llama2-7B": 4096, "Llama2-13B": 5120, "Llama2-70B": 8192, "GPT3-175B": 12288, "GPT3-175B-TP-8": 12288, "OPT-66B": 9216}
-ffn_size = {"Llama2-7B": 11008, "Llama2-13B": 13824, "Llama2-70B": 28672, "GPT3-175B": 12288*4, "GPT3-175B-TP-8": 12288*4, "OPT-66B": 9216*4}
-TransformerBlock_number = {"Llama2-7B": 32, "Llama2-13B": 40, "Llama2-70B": 80}
-minimal_channel_per_block = {"Llama2-7B": 5, "Llama2-13B": 8, "Llama2-70B": 6}
-pipeline_parallel_mode_list = ["pipeline_parallel", "pipeline_parallel_embedding"]
-model_parallel_mode_list = ["model_parallel", "model_parallel_embedding", "model_parallel_FC"]
+n_heads = {
+    "Llama2-7B": 32,
+    "Llama2-13B": 40,
+    "Llama2-70B": 64,
+    "OPT-66B": 72,
+    "Llama31-8B": 32,
+    "Llama31-70B": 64,
+    "Qwen3-30B-A3B": 32,
+    "Qwen3-235B-A22B": 64,
+    "ViT-B16": 12,
+    "ViT-H14": 16,
+    "ViT-L16": 16
+}
+
+gqa_factor = {
+    "Llama2-7B": 1,
+    "Llama2-13B": 1,
+    "Llama2-70B": 8,
+    "OPT-66B": 1,
+    "Llama31-8B": 4,
+    "Llama31-70B": 8,
+    "Qwen3-30B-A3B": 8,
+    "Qwen3-235B-A22B": 16,
+    "ViT-B16": 1,
+    "ViT-H14": 1,
+    "ViT-L16": 1
+}
+
+embedding_size = {
+    "Llama2-7B": 4096,
+    "Llama2-13B": 5120,
+    "Llama2-70B": 8192,
+    "GPT3-175B": 12288,
+    "GPT3-175B-TP-8": 12288,
+    "OPT-66B": 9216,
+    "Llama31-8B": 4096,
+    "Llama31-70B": 8192,
+    "Qwen3-30B-A3B": 2048,
+    "Qwen3-235B-A22B": 4096,
+    "ViT-B16": 768,
+    "ViT-H14": 1280,
+    "ViT-L16": 1024
+}
+
+ffn_size = {
+    "Llama2-7B": 11008,
+    "Llama2-13B": 13824,
+    "Llama2-70B": 28672,
+    "GPT3-175B": 12288*4,
+    "GPT3-175B-TP-8": 12288*4,
+    "OPT-66B": 9216*4,
+    "Llama31-8B": 14436,
+    "Llama31-70B": 28672,
+    "Qwen3-30B-A3B": 6144,
+    "Qwen3-235B-A22B": 12288,
+    "ViT-B16": 3072,
+    "ViT-H14": 5120,
+    "ViT-L16": 4096
+}
+
+TransformerBlock_number = {
+    "Llama2-7B": 32,
+    "Llama2-13B": 40,
+    "Llama2-70B": 80,
+    "OPT-66B": 64,
+    "Llama31-8B": 32,
+    "Llama31-70B": 80,
+    "Qwen3-30B-A3B": 48,
+    "Qwen3-235B-A22B": 94,
+    "ViT-B16": 12,
+    "ViT-H14": 16,
+    "ViT-L16": 16
+}
+
+minimal_channel_per_block = {
+    "Llama2-7B": 5,
+    "Llama2-13B": 8,
+    "Llama2-70B": 6,
+    "OPT-66B": 6,
+    "Llama31-8B": 5,
+    "Llama31-70B": 6,
+    "Qwen3-30B-A3B": 8,
+    "Qwen3-235B-A22B": 8,
+    "ViT-B16": 4,
+    "ViT-H14": 4,
+    "ViT-L16": 4
+}
+
+pipeline_parallel_mode_list = [
+    "pipeline_parallel",
+    "pipeline_parallel_embedding"
+]
+
+model_parallel_mode_list = [
+    "model_parallel",
+    "model_parallel_embedding",
+    "model_parallel_FC"
+]
 
 def get_args():
     parser = argparse.ArgumentParser('Process model parameters.')
     parser.add_argument("--filename", help="Name of weight file")
-    parser.add_argument("--model", choices=["llama-2-7b", "llama-2-13b", "llama-2-70b", "bloom"], help="model choice")
+    parser.add_argument("--model", choices=["llama-2-7b", "llama-2-13b", "llama-2-70b", "bloom", "opt-66b", "llama31-8b", "llama31-70b", "qwen3-30b-a3b", "qwen3-235b-a22b"], help="model choice")
     parser.add_argument("--GEMV", choices=["reuse-GB", "reuse-bank", "no-reuse"], help="GEMV choice, inner product keeps accumulation results and re-write GB, outer product keeps GB and re-write accumulation register.", default="no-reuse")
     parser.add_argument("--reuse-size", type=int, help="reuse size for either reuse-GB or reuse-bank, depends on number of MAC register size", default=2)
     parser.add_argument("--DRAM-column", type=int, help="DRAM chip columns", default=1024)
     parser.add_argument("--DRAM-row", type=int, help="DRAM chip rows", default=1024*16)
-    parser.add_argument("--burst-length", type=int, help="Burst length", default=16)
+    parser.add_argument("--burst-length", type=int, help="Burst length", default=32)  # default: 32 for INT8, 16 for BF16
     parser.add_argument("--num-banks", type=int, help="bank number per channel", default=16)
     parser.add_argument("--num-channels", type=int, help="channel number per DIMM", default=32)
     parser.add_argument("--max-seq-len", type=int, help="maximum sequence length the model supports", default=4096)
@@ -45,13 +135,15 @@ def get_args():
     parser.add_argument("--OPT-66B", action="store_true", help="OPT-66B")
     parser.add_argument("--GPT3-175B", action="store_true", help="GPT-175B")
     parser.add_argument("--GPT3-175B-TP-8", action="store_true", help="GPT-175B")
+    parser.add_argument("--Qwen3-30B-A3B", action="store_true", help="Qwen3-30B-A3B")
+    parser.add_argument("--Qwen3-235B-A22B", action="store_true", help="Qwen3-235B-A22B")
     parser.add_argument("--only-FC", action="store_true", help="generate traces for aim baseline, only FC layers")
     parser.add_argument("--double-bank", action="store_true", help="one transformer block map to 2x banks")
     parser.add_argument("--quad-bank", action="store_true", help="one transformer block map to 4x banks")
     parser.add_argument("--multi-tb-per-device", action="store_true")
     parser.add_argument("--ffn_dim", type=int, help="FFN dimension")
     parser.add_argument("--n_heads", type=int, help="Number of heads")
-    parser.add_argument("--n_kv_heads", type=int, help="Number of kv heads for GQA", default=8)
+    parser.add_argument("--n_kv_heads", type=int, help="Number of kv heads for GQA", default=4)
     parser.add_argument("--model-parallel", action="store_true", help="assign multiple transformer blocks for each CXL device")
     parser.add_argument("--pipeline-parallel", action="store_true")
     # parser.add_argument("--half-devices", action="store_true", help="use 16 devices with 256GB capacity setup")
@@ -61,6 +153,23 @@ def get_args():
     parser.add_argument("--seqlen", type=int, help="specify seqlen for only trace mode", default=4096)
     parser.add_argument("--trace-file", help="Name of generated trace file", default="null.log")
     parser.add_argument("--inter-device-attention", action="store_true")
+    parser.add_argument("--embedding_size", type=int, help="embedding size")
+    parser.add_argument("--operator", choices=[
+        "trace_rms",
+        "trace_qkv_proj",
+        "trace_rope",
+        "trace_attn_score",
+        "trace_attn_mask",
+        "trace_attn_softmax",
+        "trace_attn_o",
+        "trace_wo_proj",
+        "trace_router",
+        "trace_w1_proj",
+        "trace_w3_proj",
+        "trace_ffn_af",
+        "trace_w2_proj",
+        "all"
+    ], default="all")
     args = parser.parse_args()
     return args
 
@@ -131,7 +240,7 @@ def compare(a, b, name):
                 compare_1d(a, b, name)
         else:
             compare_1d(a, b, name)
-        print()
+        print(name + "is wrong!")
     
 
         

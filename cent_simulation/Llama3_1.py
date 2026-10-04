@@ -7,13 +7,16 @@ from utils import compare, apply_rotary_emb, repeat_kv, RMSNorm
 
 debug = True
 
-class TransformerBlockLlama(TransformerBlock):
+class TransformerBlockLlama3(TransformerBlock):
     """
     TransformerBlock Class inherits computate functionality from PIM class
     """
     def __init__(self, dic_model, args):
         super().__init__(dic_model, args)
-        
+        self.num_experts = 128
+        self.num_experts_per_token = 8
+        self.embedding_size = 2048  if args.model == "Qwen3-30B-A3B" else 4096
+        self.moe = True if args.model == "Qwen3-30B-A3B" else False
     def precision_test(self):
         # Results are different in BFloat16 in 7B
         a = RMSNorm(self.x, self.SANorm)[0][0]
@@ -27,6 +30,14 @@ class TransformerBlockLlama(TransformerBlock):
         print((a*b).sum())
         print(torch.matmul(a, b))
         print(torch.matmul(a, c))
+
+    def causal_mask(start_pos, seqlen, cache_len, device, dtype):
+        q_pos = torch.arange(start_pos, start_pos + seqlen, device=device).unsqueeze(-1)  # [seqlen, 1]
+        k_pos = torch.arange(cache_len, device=device).unsqueeze(0)                        # [1, cache_len]
+
+        mask = torch.zeros((seqlen, cache_len), device=device, dtype=dtype)
+        mask[k_pos > q_pos] = torch.finfo(dtype).min  # use the minimum value of the data type to represent -inf for masking out illegal positions 
+        return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seqlen, cache_len]
 
     def self_attention(self):
         bsz, seqlen, _ = self.x.shape
@@ -42,7 +53,6 @@ class TransformerBlockLlama(TransformerBlock):
         xq = xq.reshape(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
-
         xq, xk = apply_rotary_emb(xq, xk, self.freqs_cis)
         self.cache_k[:bsz, self.start_pos : self.start_pos + seqlen] = xk
         self.cache_v[:bsz, self.start_pos : self.start_pos + seqlen] = xv
@@ -56,6 +66,8 @@ class TransformerBlockLlama(TransformerBlock):
         values = values.transpose(1, 2)
 
         scores = torch.matmul(xq, keys) / math.sqrt(self.head_dim)
+        # DONE: Add causal mask
+        scores = scores + causal_mask(self.start_pos, seqlen, keys.shape[-1], scores.device, scores.dtype)
         scores = F.softmax(scores, dim=-1).type_as(xq)
         compare(scores[0][0], self.scores[0][0], "scores")
 
@@ -66,7 +78,52 @@ class TransformerBlockLlama(TransformerBlock):
         compare(sa[0][0], self.sa[0][0], "sa")
         sa = self.x + sa
         return sa
-    
+
+    # ============================================================
+    # Llama3.1 Operator list   
+    # ============================================================
+    # trace_rms()
+    # trace_qkv_proj()
+    # trace_rope()
+    # trace_attn_score()
+    # trace_attn_mask()
+    # trace_attn_softmax()
+    # trace_attn_o()
+    # trace_wo_proj()
+    # trace_w1_proj()
+    # trace_w3_proj()
+    # trace_ffn_af()
+    # trace_w2_proj()
+
+    # ============================================================
+    # Qwen3 MoE Operator list   
+    # ============================================================
+    # trace_rms()
+    # trace_qkv_proj()
+    # trace_rope()
+    # trace_attn_score()
+    # trace_attn_mask()
+    # trace_attn_softmax()
+    # trace_attn_o()
+    # trace_wo_proj()
+    # trace_router()
+    # trace_w1_proj()
+    # trace_w3_proj()
+    # trace_ffn_af()
+    # trace_w2_proj()
+
+    # ============================================================
+    # ViT Operator list   
+    # ============================================================
+    # trace_qkv_proj()
+    # trace_attn_score()
+    # trace_attn_mask()
+    # trace_attn_softmax()
+    # trace_attn_o()
+    # trace_wo_proj() = trace_qkv_proj()
+    # trace_w1_proj()
+    # trace_w2_proj()
+
     def self_attention_aim(self):
         bsz, _, _ = self.x.shape
         seqlen = self.start_pos.item() + 1
@@ -414,6 +471,22 @@ class TransformerBlockLlama(TransformerBlock):
         compare(ffn[0][0], self.ffn[0][0], "ffn")
         out = sa + ffn
         return out
+
+    # Qwen3-30b-A3b
+    def FFN_moe(self, sa):
+        router_logits = F.linear(x, router_w)          # (2048) -> (128)
+        topk_val, topk_idx = torch.topk(router_logits, 8)
+        outputs = []
+        for i in range(8):
+            eid = topk_idx[i]
+
+            x1 = F.linear(x, gate_proj[eid])           # 2048 -> 768
+            x3 = F.linear(x, up_proj[eid])             # 2048 -> 768
+            h  = F.silu(x1) * x3
+            y  = F.linear(h, down_proj[eid])           # 768 -> 2048
+            outputs.append(topk_val[i] * y)
+        out = sum(outputs)
+        return out
     
     def FFN_aim(self, sa_aim):
         bsz, _, _ = self.sa.shape
@@ -613,11 +686,6 @@ class TransformerBlockLlama(TransformerBlock):
         channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
         channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
         num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
-
-        # ============================================================
-        # Llama Submodule: RMSNorm (pre-attention) on x  [SANorm]
-        # Corresponds to: RMSNorm_x = RMSNorm(x, SANorm)
-        # ============================================================
 
         # ------------------------------------------------------------
         # Llama Operator: RMSNorm - x.pow(2) reduction / sum
@@ -883,6 +951,94 @@ class TransformerBlockLlama(TransformerBlock):
             # Query x key_cache GEMV
             # --------------------------------------------------------             
             self.Vector_Matrix_Mul_score_pim_only_trace(self.cache_k_row_index, seqlen, "breakdown_sa_score")
+   
+    def trace_attn_mask(self):
+        # ================================
+        # [Setup] Trace context / mapping
+        # ================================
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+
+        # --------------------------------------------------------
+        # Llama Operator: Attention mask add
+        # Conceptual op:
+        #   scores = scores + causal_mask
+        #
+        # Impl:
+        #   1) stage causal mask in score-compatible layout
+        #   2) stage score rows
+        #   3) EWADD row-by-row
+        #   4) load masked scores back for softmax
+        # --------------------------------------------------------
+        if self.trace_attention:
+            rows_per_score = (seqlen - 1) // self.DRAM_column + 1           # ceil(seqlen/DRAM_column)
+            num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1           #
+
+            # --------------------------------------------------------
+            # Prepare / stage causal mask
+            # Put causal mask in the same layout as scores, into operand slot1 for EWMUL 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                1,
+                seqlen
+            )
+
+            # --------------------------------------------------------
+            # Stage original score
+            # Put attention scores in the same layout as scores, into operand slot0 for EWMUL 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                0,
+                seqlen
+            )
+
+            # --------------------------------------------------------
+            # score + causal_mask
+            # --------------------------------------------------------
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    # The last row might not fully utilize DRAM_column
+                    if row == rows_per_score - 1:
+                        offset = seqlen - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+
+                    op_size = (offset - 1) // self.burst_length + 1
+                    self.EWADD_only_trace(op_size)
+
+            # --------------------------------------------------------
+            # Load masked scores back / synchronize
+            # result slot 2 -> masked scores
+            # --------------------------------------------------------
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.load_from_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                2,
+                seqlen
+            )
+            self.SYNC_only_trace()
 
     def trace_attn_softmax(self):
         # ================================
@@ -903,6 +1059,76 @@ class TransformerBlockLlama(TransformerBlock):
         channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
         num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
     
+
+        # --------------------------------------------------------
+        # Llama Operator: Attention mask add
+        # Conceptual op:
+        #   scores = scores + causal_mask
+        #
+        # Impl:
+        #   1) stage causal mask in score-compatible layout
+        #   2) stage score rows
+        #   3) EWADD row-by-row
+        #   4) load masked scores back for softmax
+        # --------------------------------------------------------
+        if self.trace_attention:
+            rows_per_score = (seqlen - 1) // self.DRAM_column + 1           # ceil(seqlen/DRAM_column)
+            num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1           #
+
+            # --------------------------------------------------------
+            # Prepare / stage causal mask
+            # Put causal mask in the same layout as scores, into operand slot1 for EWMUL 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                1,
+                seqlen
+            )
+
+            # --------------------------------------------------------
+            # Stage original score
+            # Put attention scores in the same layout as scores, into operand slot0 for EWMUL 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                0,
+                seqlen
+            )
+
+            # --------------------------------------------------------
+            # score + causal_mask
+            # --------------------------------------------------------
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    # The last row might not fully utilize DRAM_column
+                    if row == rows_per_score - 1:
+                        offset = seqlen - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+
+                    op_size = (offset - 1) // self.burst_length + 1
+                    self.EWADD_only_trace(op_size)
+
+            # --------------------------------------------------------
+            # Load masked scores back / synchronize
+            # result slot 2 -> masked scores
+            # --------------------------------------------------------
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.load_from_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                2,
+                seqlen
+            )
+            self.SYNC_only_trace()
+
         # --------------------------------------------------------
         # Llama Operator: Attention softmax = exp(scores) / sum(exp(scores))
         # Implementation: exp -> sum reduction -> reciprocal -> scale
@@ -1045,14 +1271,12 @@ class TransformerBlockLlama(TransformerBlock):
         ffn_dim = self.w1.shape[0]
         ffn_bank_group_length = (ffn_dim - 1) // (total_banks // 4) + 1
         ffn_bank_group_utilized_banks = (ffn_dim - 1) // ffn_bank_group_length + 1
-
         if self.trace_fc_ffn:
-            self.Vector_Matrix_Mul_weight_af_pim_only_trace(
-                channel_lst, self.w1_row_index,
-                self.dim, ffn_dim,
-                FC_total_banks, "breakdown_ffn_weight"
-            )
-
+            if self.moe:
+                self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.embedding_size, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+            else:
+                self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+  
     def trace_w3_proj(self):
         # ================================
         # [Setup] Trace context / mapping
@@ -1082,12 +1306,11 @@ class TransformerBlockLlama(TransformerBlock):
         ffn_bank_group_utilized_banks = (ffn_dim - 1) // ffn_bank_group_length + 1
 
         if self.trace_fc_ffn:
-            self.Vector_Matrix_Mul_weight_af_pim_only_trace(
-                channel_lst, self.w3_row_index,
-                self.dim, ffn_dim,
-                FC_total_banks, "breakdown_ffn_weight"
-            )
-
+            if self.moe:
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w3_row_index, self.embedding_size, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+            else:
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w3_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+   
     def trace_w2_proj(self):
         # ================================
         # [Setup] Trace context / mapping
@@ -1116,11 +1339,120 @@ class TransformerBlockLlama(TransformerBlock):
         # Conceptual op: ffn_out = (silu(x1) * x3) @ W2
         # ------------------------------------------------------------
         if self.trace_fc_ffn:
-            self.Vector_Matrix_Mul_weight_pim_only_trace(
-                channel_lst, self.w2_row_index,
-                ffn_dim, self.dim,
-                FC_total_banks, "breakdown_ffn_weight"
-            )
+            if self.moe:
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim, self.embedding_size, FC_total_banks, "breakdown_ffn_weight")
+            else:
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim, self.dim, FC_total_banks, "breakdown_ffn_weight")
+      
+    def trace_router(self):
+        # ================================
+        # [Setup] Trace context / mapping
+        # ================================
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+
+        num_experts = self.num_experts
+        # --------------------------------------------------------
+        # Llama Operator: Top-K MoE Router
+        # Conceptual op:
+        #   router_logits, router_top_value, router_indices = self.gate(hidden_states)
+        #
+        # Impl:
+        #   1) calculate router logits with router weight (modeled as regular FC here)
+        #   2) softmax and get router logits
+        #   3) choose top-k expert with highest router logits 
+        # --------------------------------------------------------
+
+        # --------------------------------------------------------
+        #  1) 
+        # --------------------------------------------------------   
+        router_logits = self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.FFNNorm_row_index, self.embedding_size, self.num_experts, FC_total_banks, "breakdown_ffn_weight")# -> (128,)
+
+        # --------------------------------------------------------
+        #  2) 
+        # --------------------------------------------------------
+        if self.trace_softmax:
+            # --------------------------------------------------------
+            # CXL Port write scale
+            # --------------------------------------------------------
+            rows_per_score = (num_experts - 1) // self.DRAM_column + 1
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, num_experts)
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, num_experts)
+        
+            # --------------------------------------------------------
+            # Scale score
+            # --------------------------------------------------------
+            num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    if row == rows_per_score - 1:
+                        offset = num_experts - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+                    self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+            
+            # --------------------------------------------------------
+            # CXL Port write mean of sum(exp)
+            # --------------------------------------------------------
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, num_experts)
+            self.SYNC_only_trace()
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, num_experts)
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, num_experts)
+        
+        
+            # --------------------------------------------------------
+            # Scale exp
+            # --------------------------------------------------------
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    if row == rows_per_score - 1:
+                        offset = num_experts - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+                    self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, num_experts)
+            self.SYNC_only_trace()
+
+        # --------------------------------------------------------
+        #  3) 
+        # --------------------------------------------------------
+        self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+        self.store_for_EWMUL_score_only_trace(
+            channels_required,
+            self.scores_row_index,
+            total_banks,
+            0,
+            num_experts
+        )
+
+        self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + self.num_experts_per_token // self.burst_length
+        self.load_from_EWMUL_score_only_trace(
+            channels_required,
+            self.scores_row_index,
+            total_banks,
+            2,
+            self.num_experts_per_token
+        )
+        self.SYNC_only_trace()
 
     def trace_ffn_af(self):
         # ================================
@@ -1375,6 +1707,75 @@ class TransformerBlockLlama(TransformerBlock):
             # Query x key_cache GEMV
             self.Vector_Matrix_Mul_score_pim_only_trace(self.cache_k_row_index, seqlen, "breakdown_sa_score")
 
+        # --------------------------------------------------------
+        # Llama Operator: Attention mask add
+        # Conceptual op:
+        #   scores = scores + causal_mask
+        #
+        # Impl:
+        #   1) stage causal mask in score-compatible layout
+        #   2) stage score rows
+        #   3) EWADD row-by-row
+        #   4) load masked scores back for softmax
+        # --------------------------------------------------------
+        if self.trace_attention:
+            rows_per_score = (seqlen - 1) // self.DRAM_column + 1           # ceil(seqlen/DRAM_column)
+            num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1           #
+
+            # --------------------------------------------------------
+            # Prepare / stage causal mask
+            # Put causal mask in the same layout as scores, into operand slot1 for EWMUL 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                1,
+                seqlen
+            )
+
+            # --------------------------------------------------------
+            # Stage original score
+            # Put attention scores in the same layout as scores, into operand slot0 for EWMUL 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                0,
+                seqlen
+            )
+
+            # --------------------------------------------------------
+            # score + causal_mask
+            # --------------------------------------------------------
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    # The last row might not fully utilize DRAM_column
+                    if row == rows_per_score - 1:
+                        offset = seqlen - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+
+                    op_size = (offset - 1) // self.burst_length + 1
+                    self.EWADD_only_trace(op_size)
+
+            # --------------------------------------------------------
+            # Load masked scores back / synchronize
+            # result slot 2 -> masked scores
+            # --------------------------------------------------------
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.load_from_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                2,
+                seqlen
+            )
+            self.SYNC_only_trace()
+
         # ============================================================
         # [Split Mapping] trace_attn_softmax()
         # score scaling / normalization path
@@ -1484,6 +1885,101 @@ class TransformerBlockLlama(TransformerBlock):
             self.load_from_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 2, self.FFNNorm_row_index, input_vector_EWMUL_length)
             self.SYNC_only_trace()
 
+        
+        if self.trace_fc_ffn:
+        
+            num_experts = self.num_experts
+            # --------------------------------------------------------
+            # Llama Operator: Top-K MoE Router
+            # Conceptual op:
+            #   router_logits, router_top_value, router_indices = self.gate(hidden_states)
+            #
+            # Impl:
+            #   1) calculate router logits with router weight (modeled as regular FC here)
+            #   2) softmax and get router logits
+            #   3) choose top-k expert with highest router logits 
+            # --------------------------------------------------------
+
+            # --------------------------------------------------------
+            #  1) 
+            # --------------------------------------------------------   
+            router_logits = self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.FFNNorm_row_index, self.embedding_size, self.num_experts, FC_total_banks, "breakdown_ffn_weight")# -> (128,)
+
+            # --------------------------------------------------------
+            #  2) 
+            # --------------------------------------------------------
+            if self.trace_softmax:
+                # --------------------------------------------------------
+                # CXL Port write scale
+                # --------------------------------------------------------
+                rows_per_score = (num_experts - 1) // self.DRAM_column + 1
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+                self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, num_experts)
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+                self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, num_experts)
+            
+                # --------------------------------------------------------
+                # Scale score
+                # --------------------------------------------------------
+                num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1
+                for score_index in range(num_scores_per_bank):
+                    for row in range(rows_per_score):
+                        if row == rows_per_score - 1:
+                            offset = num_experts - row * self.DRAM_column
+                        else:
+                            offset = self.DRAM_column
+                        self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+                
+                # --------------------------------------------------------
+                # CXL Port write mean of sum(exp)
+                # --------------------------------------------------------
+                self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + num_experts // self.burst_length
+                self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, num_experts)
+                self.SYNC_only_trace()
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+                self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, num_experts)
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+                self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, num_experts)
+            
+            
+                # --------------------------------------------------------
+                # Scale exp
+                # --------------------------------------------------------
+                for score_index in range(num_scores_per_bank):
+                    for row in range(rows_per_score):
+                        if row == rows_per_score - 1:
+                            offset = num_experts - row * self.DRAM_column
+                        else:
+                            offset = self.DRAM_column
+                        self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+
+                self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + num_experts // self.burst_length
+                self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, num_experts)
+                self.SYNC_only_trace()
+
+            # --------------------------------------------------------
+            #  3) 
+            # --------------------------------------------------------
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + num_experts // self.burst_length
+            self.store_for_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                0,
+                num_experts
+            )
+
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + self.num_experts_per_token // self.burst_length
+            self.load_from_EWMUL_score_only_trace(
+                channels_required,
+                self.scores_row_index,
+                total_banks,
+                2,
+                self.num_experts_per_token
+            )
+            self.SYNC_only_trace()
+
+
         # ============================================================
         # [Split Mapping] trace_w1_proj() + trace_w3_proj()
         # FFN gate/up projections
@@ -1494,9 +1990,14 @@ class TransformerBlockLlama(TransformerBlock):
         ffn_bank_group_length = (ffn_dim - 1) // (total_banks // 4) + 1
         ffn_bank_group_utilized_banks = (ffn_dim - 1) // ffn_bank_group_length + 1
         if self.trace_fc_ffn:
-            self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
-            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w3_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
-
+            if self.moe:
+                self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.embedding_size, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w3_row_index, self.embedding_size, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+            else:
+                self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w3_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+       
+       
         # ============================================================
         # [Split Mapping] trace_ffn_af()
         # SwiGLU activation and gating
@@ -1562,9 +2063,14 @@ class TransformerBlockLlama(TransformerBlock):
 
         # w2 FFN GEMV
         if self.trace_fc_ffn:
-            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim, self.dim, FC_total_banks, "breakdown_ffn_weight")
+            if self.moe:
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim, self.embedding_size, FC_total_banks, "breakdown_ffn_weight")
+            else:
+                self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim, self.dim, FC_total_banks, "breakdown_ffn_weight")
         if self.trace_norm:
             self.EWADD_only_trace(self.dim // self.burst_length)
+
+
 
     def trace_only_embedding(self):
         bsz, _, _ = self.x.shape

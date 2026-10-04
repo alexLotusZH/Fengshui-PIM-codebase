@@ -13,7 +13,8 @@ class TransformerBlockGPT(TransformerBlock):
     def __init__(self, dic_model, args):
         super().__init__(dic_model, args)
 
-    def trace_only(self):
+    def trace_rms(self):
+
         bsz, _, _ = self.x.shape
         seqlen = self.seqlen
         total_banks = self.total_banks
@@ -27,6 +28,7 @@ class TransformerBlockGPT(TransformerBlock):
         channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
         num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
 
+        # >>> Stage-A :: trace_rms_pre() | pre-attention RMS/Norm path on x
         input_vector_neighbor_bank_length = (self.dim // self.TP_param - 1) // (self.total_banks // 2) + 1
         input_vector_neighbor_bank_utilized_banks = (self.dim // self.TP_param - 1) // input_vector_neighbor_bank_length + 1
         if self.trace_norm:
@@ -73,13 +75,41 @@ class TransformerBlockGPT(TransformerBlock):
             self.time["RD_SBK"] += self.timing_constant["RD_SBK"] + self.dim // self.burst_length
             self.load_from_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 2, self.SANorm_row_index, input_vector_EWMUL_length)
             self.SYNC_only_trace()
-
+    
+    def trace_qkv_proj(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-B :: trace_qkv_proj() | Q/K/V projection
         # K/Q/V GEMV
         if self.trace_fc_kqvo:
             self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wq_row_index, self.dim, self.head_dim * self.n_heads, FC_total_banks, "breakdown_sa_weight")
             self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wk_row_index, self.dim, self.head_dim * self.n_kv_heads, FC_total_banks, "breakdown_sa_weight")
             self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wv_row_index, self.dim, self.head_dim * self.n_kv_heads, FC_total_banks, "breakdown_sa_weight")
-
+  
+    def trace_attn_score(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-C :: trace_attn_score() | KV cache write + Q x K_cache^T
         # CXL Port
         if self.trace_attention:
             # Store xk
@@ -146,6 +176,20 @@ class TransformerBlockGPT(TransformerBlock):
             # Query x key_cache GEMV
             self.Vector_Matrix_Mul_score_pim_only_trace(self.cache_k_row_index, seqlen, "breakdown_sa_score")
 
+    def trace_attn_softmax(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-D :: trace_attn_softmax() | score normalization
         if self.trace_softmax:
             
             self.store_for_score_only_trace(self.scores_row_index, self.FC_total_banks, seqlen)
@@ -193,13 +237,301 @@ class TransformerBlockGPT(TransformerBlock):
             self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, seqlen)
             self.SYNC_only_trace()
 
+
+    def trace_attn_o(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-E :: trace_attn_o() | Softmax(score) x V_cache
         if self.trace_attention:
             # Score x value_cache GEMV
             self.Vector_Matrix_Mul_output_pim_only_trace(self.cache_v_row_index, seqlen, "breakdown_sa_output")
 
+
+    def trace_wo_proj(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-F :: trace_wo_proj() | attention output projection
         # Output GEMV
         if self.trace_fc_kqvo:
             self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wo_row_index, self.dim, self.head_dim * self.n_heads, FC_total_banks, "breakdown_sa_weight")
+
+    def trace_w1_proj(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-H :: trace_w1_proj() | FFN gate/up projection
+        # w1 FFN GEMV
+        ffn_dim = self.w1.shape[0]
+        ffn_bank_group_length = (ffn_dim - 1) // (total_banks // 4) + 1
+        ffn_bank_group_utilized_banks = (ffn_dim - 1) // ffn_bank_group_length + 1
+        if self.trace_fc_ffn:
+            self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
+
+    def trace_w2_proj(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+
+        ffn_dim = self.w1.shape[0]
+        ffn_bank_group_length = (ffn_dim - 1) // (total_banks // 4) + 1
+        ffn_bank_group_utilized_banks = (ffn_dim - 1) // ffn_bank_group_length + 1
+        if self.trace_fc_ffn:
+            # >>> Stage-I :: trace_w2_proj() | FFN down projection
+            # w2 FFN GEMV
+            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim * self.TP_param, self.dim // self.TP_param, FC_total_banks, "breakdown_ffn_weight")
+
+    def trace_residual(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+        # >>> Stage-J :: trace_residual_out() | final residual add
+        if self.trace_norm:
+            self.EWADD_only_trace(self.dim // self.TP_param // self.burst_length)
+
+
+
+    def trace_only(self):
+        bsz, _, _ = self.x.shape
+        seqlen = self.seqlen
+        total_banks = self.total_banks
+        if self.model_parallel:
+            FC_total_banks = total_banks * self.FC_devices
+            channels_required = self.num_channels
+        else:
+            FC_total_banks = total_banks
+            channels_required = self.channels_per_block
+        channel_multi_transformer_block_required = self.num_channels // channels_required * channels_required
+        channel_lst = [channel for channel in range(channel_multi_transformer_block_required)]
+        num_transformer_blocks_per_device = max(self.num_channels // channels_required, 1)
+
+        # >>> Stage-A :: trace_rms_pre() | pre-attention RMS/Norm path on x
+        input_vector_neighbor_bank_length = (self.dim // self.TP_param - 1) // (self.total_banks // 2) + 1
+        input_vector_neighbor_bank_utilized_banks = (self.dim // self.TP_param - 1) // input_vector_neighbor_bank_length + 1
+        if self.trace_norm:
+            self.store_for_neighbor_bank_input_only_trace(self.channels_per_block, input_vector_neighbor_bank_utilized_banks, 0, self.x_row_index, input_vector_neighbor_bank_length)
+            self.store_for_neighbor_bank_input_only_trace(self.channels_per_block, input_vector_neighbor_bank_utilized_banks, 1, self.x_row_index, input_vector_neighbor_bank_length)
+
+        # Norm   x.pow   MAC_ABK
+        input_vector_MAB_BK_BK_length = (self.dim // self.TP_param - 1) // (total_banks // 2) + 1
+        if self.trace_norm:
+            self.WR_BIAS_only_trace(channel_lst)
+            self.MAC_ABK_only_trace(channel_lst, self.x_row_index, (input_vector_MAB_BK_BK_length - 1) // self.burst_length + 1, "breakdown_sa_pow")
+            self.RD_MAC_only_trace(channel_lst)
+
+        # CXL Port  
+        # Reduction of dim // 16 intermidiate sum read from MAC
+        # Broadcast a scalar to vector and store it for EWMUL
+        input_vector_EWMUL_length = (self.dim // self.TP_param - 1) // (total_banks // 4) + 1
+        input_vector_EWMUL_utilized_banks = (self.dim // self.TP_param - 1) // input_vector_EWMUL_length + 1
+        if self.trace_norm:
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.dim // self.burst_length
+            # Standard Deviation   EWADD
+            self.EWADD_only_trace(self.dim // self.TP_param)
+            self.store_for_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 0, self.x_copy_row_index, input_vector_EWMUL_length)
+            self.store_for_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 1, self.x_copy_row_index, input_vector_EWMUL_length)
+
+            # Standard Deviation   EWMUL
+            self.EWMUL_only_trace(channel_lst, self.x_copy_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+
+            for bank in range(self.num_banks):
+                bank_group_index = 2
+                if bank % 4 == bank_group_index:
+                    self.COPY_BK_GB_only_trace(channel_lst, bank, self.x_copy_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+                    self.COPY_GB_BK_only_trace(channel_lst, bank-1, self.SANorm_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+            self.EWMUL_only_trace(channel_lst, self.x_copy_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+
+            for bank in range(self.num_banks):
+                bank_group_index = 2
+                if bank % 4 == bank_group_index:
+                    self.COPY_BK_GB_only_trace(channel_lst, bank, self.x_copy_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+                    self.COPY_GB_BK_only_trace(channel_lst, bank-1, self.SANorm_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+            self.EWMUL_only_trace(channel_lst, self.SANorm_row_index, (input_vector_EWMUL_length - 1) // self.burst_length + 1)
+
+            # Read RMSNorm result vector to GPR
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] + self.dim // self.burst_length
+            self.load_from_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 2, self.SANorm_row_index, input_vector_EWMUL_length)
+            self.SYNC_only_trace()
+
+        # >>> Stage-B :: trace_qkv_proj() | Q/K/V projection
+        # K/Q/V GEMV
+        if self.trace_fc_kqvo:
+            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wq_row_index, self.dim, self.head_dim * self.n_heads, FC_total_banks, "breakdown_sa_weight")
+            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wk_row_index, self.dim, self.head_dim * self.n_kv_heads, FC_total_banks, "breakdown_sa_weight")
+            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wv_row_index, self.dim, self.head_dim * self.n_kv_heads, FC_total_banks, "breakdown_sa_weight")
+
+        # >>> Stage-C :: trace_attn_score() | KV cache write + Q x K_cache^T
+        # CXL Port
+        if self.trace_attention:
+            # Store xk
+            seq = seqlen - 1
+            dimm_index, channel_index, bank_index = self.bank_index(seq % self.FC_total_banks)
+            rows = self.head_dim * self.n_kv_heads // self.DRAM_column
+            for row in range(rows):
+                self.time["WR_SBK"] += self.timing_constant["WR_SBK"] + self.DRAM_column // self.burst_length
+                for tb in range(num_transformer_blocks_per_device):
+                    self.W_MEM_only_trace(channel_index + tb * channels_required, bank_index, self.cache_k_row_index + seq // self.FC_total_banks * rows + row, self.DRAM_column)
+            # Store xv
+            if self.intra_device_attention:
+                num_rows_per_seq = (seq - 1) // self.DRAM_column + 1
+                row_offset = num_rows_per_seq - 1
+                rows_per_dim = self.max_seq_len // self.DRAM_column
+                num_heads_per_bank = (self.n_kv_heads - 1) // self.channels_per_block + 1
+                dim_iteration = self.head_dim // self.num_banks
+                for head_index_per_bank in range(num_heads_per_bank):
+                    row_current_head = self.cache_v_row_index + (rows_per_dim * dim_iteration) * head_index_per_bank
+                    for dim_iter in range(dim_iteration):
+                        for channel in range(channels_required):
+                            head = channel * num_heads_per_bank + head_index_per_bank
+                            if head > self.n_kv_heads - 1:
+                                break
+                            # for bank in range(self.num_banks):
+                            #     dim = dim_iter * self.num_banks + bank
+                            #     self.W_MEM_only_trace(channel, bank, row_current_head + dim_iter * rows_per_dim + row_offset, 1)
+                            self.WR_ABK_only_trace(channel, row_current_head + dim_iter * rows_per_dim + row_offset, 1)
+            else:
+                # if banks_per_head < 16, channels_per_head < 1, one bank has more than one head, throw error
+                # if 16 <= banks_per_head < 128, dim_iterations > 1, channels_per_head >= 1
+                # if 128 <= banks_per_head < 512, dim_iterations = 1, devices_per_head = 1
+                # if 512 <= banks_per_head, dim_iterations = 1, devices_per_head > 1
+                                                                                                    # seqlen = 32k, head_dim = 128
+                banks_per_head = (self.FC_total_banks - 1) // self.n_kv_heads + 1                   # 32, 256, 2k
+                channels_per_head = (banks_per_head - 1) // (self.num_banks) + 1                    # 2,  16,  128
+                devices_per_head = (channels_per_head - 1) // (self.num_channels) + 1               # 1,  1,   4
+                # iteration along the head dimension
+                dim_iterations = (self.head_dim - 1) // banks_per_head + 1                          # 4,  1,   1
+                # iteration along the sequence dimension or rows per sequence
+                rows_per_seq_iteration = (banks_per_head - 1) // self.head_dim + 1                  # 1,  2,   16
+                seq_iterations = (seqlen - 1) // (self.DRAM_column * rows_per_seq_iteration) + 1    # 32, 16,  2
+                rows_per_seq = (seqlen - 1) // (self.DRAM_column) + 1                               # 32, 32,  32
+                channels_per_row_offset = (self.head_dim - 1) // self.num_banks + 1                 # 8
+                for channel in range(channels_required):
+                    if banks_per_head < self.num_banks:
+                        raise ValueError("banks_per_head < self.num_banks. One head is mapped to less than one channel. Not enough channels are allocated.")
+                    head = channel // (banks_per_head // self.num_banks)
+                    if banks_per_head < 128:    # dim_iterations > 1, more than one dim in each row_offset are stored to a bank
+                        for dim_iter in range(dim_iterations):   # E.g., head_dim = 128, banks_per_head = 32, channels_per_head = 2, dim_iterations = 128 / 32 = 4 in each bank. Within each iteration, Channel 0 is responsible for head 0: [0-15, 32-47, 64-79, 96-111], Channel 1 is responsible for head 1: [16-31, 48-63, 80-95, 112-127]. For bias vector, each head looks like (----CH0 16 Banks----,----CH1 16 Banks----) * 4.
+                            row_offset = rows_per_seq - 1
+                            self.WR_ABK_only_trace(channel, self.cache_v_row_index + row_offset * dim_iterations + dim_iter, 1)
+                    else:
+                        # each head is mapped on a single device, channels_per_row_offset = 128 / 16 = 8
+                        # E.g., head_dim = 128, banks_per_head = 256, channels_per_head = 16. Channel 0 is responsible for head 0: [0][0-15], Channel 1 is responsible for head 0: [0][16-31], ..., Channel 7 is responsible for head 0: [0][112-127], Channel 8 is responsible for head 0: [1][0-15], Channel 9 is responsible for head 0: [1][16-31], ..., Channel 15 is responsible for head 0: [1][112-127]. For bias vector, each head has rows_per_seq_iteration = 2: (----CH0 16 Banks----) * 8, (----CH8 16 Banks----) * 8.
+                        # each head is mapped on multiple devices
+                        # E.g. head_dim = 128, banks_per_head = 2048, channels_per_head = 128. Channel 0 is responsible for head 0: [0][0-15], Channel 1 is responsible for head 0: [0][16-31], ..., Channel 127 is responsible for head 0: [15][112-127]. For bias vector, each head has rows_per_seq_iteration = 16: (----CH0 16 Banks----) * 128, ..., (----CH112 16 Banks----) * 128.
+                        for bank in range(self.num_banks):
+                            dim = ((channel % channels_per_head) % channels_per_row_offset) * self.num_banks + bank
+                            if (channel % channels_per_head) // channels_per_row_offset == rows_per_seq - 1:
+                                row_offset = rows_per_seq - 1
+                                self.WR_ABK_only_trace(channel, self.cache_v_row_index + row_offset // rows_per_seq_iteration, 1)
+            
+            # Query x key_cache GEMV
+            self.Vector_Matrix_Mul_score_pim_only_trace(self.cache_k_row_index, seqlen, "breakdown_sa_score")
+
+        # >>> Stage-D :: trace_attn_softmax() | score normalization
+        if self.trace_softmax:
+            
+            self.store_for_score_only_trace(self.scores_row_index, self.FC_total_banks, seqlen)
+            self.SYNC_only_trace()
+            self.load_for_score_only_trace(self.scores_row_index, self.FC_total_banks, seqlen)
+            self.SYNC_only_trace()
+
+        if False:
+            # CXL Port write scale
+            rows_per_score = (seqlen - 1) // self.DRAM_column + 1
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, seqlen)
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, seqlen)
+
+            # Scale score
+            num_scores_per_bank = (self.n_heads - 1) // (self.channels_per_block * 4) + 1
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    if row == rows_per_score - 1:
+                        offset = seqlen - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+                    self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+            
+            # CXL Port write mean of sum(exp)
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, seqlen)
+            self.SYNC_only_trace()
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 0, seqlen)
+            self.time["WR_SBK"] += self.timing_constant["WR_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.store_for_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 1, seqlen)
+
+            # Scale exp
+            for score_index in range(num_scores_per_bank):
+                for row in range(rows_per_score):
+                    if row == rows_per_score - 1:
+                        offset = seqlen - row * self.DRAM_column
+                    else:
+                        offset = self.DRAM_column
+                    self.EWMUL_only_trace(channel_lst, self.scores_row_index + score_index * rows_per_score + row, (offset - 1) // self.burst_length + 1)
+
+            self.time["RD_SBK"] += self.timing_constant["RD_SBK"] * rows_per_score + seqlen // self.burst_length
+            self.load_from_EWMUL_score_only_trace(channels_required, self.scores_row_index, total_banks, 2, seqlen)
+            self.SYNC_only_trace()
+
+        # >>> Stage-E :: trace_attn_o() | Softmax(score) x V_cache
+        if self.trace_attention:
+            # Score x value_cache GEMV
+            self.Vector_Matrix_Mul_output_pim_only_trace(self.cache_v_row_index, seqlen, "breakdown_sa_output")
+
+        # >>> Stage-F :: trace_wo_proj() | attention output projection
+        # Output GEMV
+        if self.trace_fc_kqvo:
+            self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.wo_row_index, self.dim, self.head_dim * self.n_heads, FC_total_banks, "breakdown_sa_weight")
+
+        # >>> Stage-G :: trace_rms_post() | residual + FFN-input RMS/Norm on sa
         if self.trace_norm:
             self.EWADD_only_trace(self.dim // self.burst_length)
 
@@ -247,6 +579,7 @@ class TransformerBlockGPT(TransformerBlock):
             self.load_from_EWMUL_input_only_trace(channels_required, input_vector_EWMUL_utilized_banks, 2, self.FFNNorm_row_index, input_vector_EWMUL_length)
             self.SYNC_only_trace()
 
+        # >>> Stage-H :: trace_w1_proj() | FFN gate/up projection
         # w1 FFN GEMV
         ffn_dim = self.w1.shape[0]
         ffn_bank_group_length = (ffn_dim - 1) // (total_banks // 4) + 1
@@ -254,8 +587,11 @@ class TransformerBlockGPT(TransformerBlock):
         if self.trace_fc_ffn:
             self.Vector_Matrix_Mul_weight_af_pim_only_trace(channel_lst, self.w1_row_index, self.dim, ffn_dim, FC_total_banks, "breakdown_ffn_weight")
 
+            # >>> Stage-I :: trace_w2_proj() | FFN down projection
             # w2 FFN GEMV
             self.Vector_Matrix_Mul_weight_pim_only_trace(channel_lst, self.w2_row_index, ffn_dim * self.TP_param, self.dim // self.TP_param, FC_total_banks, "breakdown_ffn_weight")
+
+        # >>> Stage-J :: trace_residual_out() | final residual add
         if self.trace_norm:
             self.EWADD_only_trace(self.dim // self.TP_param // self.burst_length)
 
