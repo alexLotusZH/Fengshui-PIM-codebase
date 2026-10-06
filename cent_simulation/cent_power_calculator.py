@@ -180,11 +180,13 @@ def command_processor(stat_path):
     stat["utilization"] = 100.00 - (stat["idle_cycles"] / CH_PER_DV / stat["cycles"]) * 100.00
     return stat
 
-def power_calculator(stat, PCIE_bits, Head, HiddenDim, Tokens, GQA, Operator):
+def power_calculator(stat, PCIE_bits, Head, HiddenDim, Tokens, GQA, Operator=None):
     # Flags for testing rms, softmax and rope
-    RMS_flag = Operator == "trace_rms" or not Operator 
-    Softmax_flag = Operator == "trace_attn_softmax" or not Operator    
-    RoPE_flag = Operator == "trace_rope" or not Operator 
+    all_ops = not Operator or Operator == "all"
+    RMS_flag     = all_ops or Operator == "trace_rms"
+    Softmax_flag = all_ops or Operator == "trace_attn_softmax"
+    RoPE_flag    = all_ops or Operator == "trace_rope"
+
 
     energy = {}
     latency = {}
@@ -207,6 +209,7 @@ def power_calculator(stat, PCIE_bits, Head, HiddenDim, Tokens, GQA, Operator):
     latency["Softmax_latency"] = 0
     latency["RotEmbed_latency"] = 0
 
+    # Calculate the latencies only when the operators are enabled
     if RMS_flag:
         latency["RMSNorm_latency"] =  HiddenDim / 16.00 / 16.00 / CH_PER_DV * ACCEL_CYCLE["VEC"]    # EMB /16.00 /16.00 ADD
         latency["RMSNorm_latency"] += SB_RD_CYCLE + SB_WR_CYCLE + 1.00                              # 1 RED

@@ -64,6 +64,15 @@ Outputs, written to the current directory:
 - `simulation_results.csv`: raw results for each simulated sequence length.
 - `processed_results_Llama31-8B_trace_qkv_proj_end2end.csv`: results averaged over the selected phase. The filename can be specified through args.
 
+Both CSVs have an `Operator` column, so results of different operators can share one file.
+Rerunning the same model, operator and configuration replaces the old row.
+A CSV written by an older version of `run_sim.py` has no `Operator` column and is rejected; delete it and rerun.
+
+Traces and Ramulator logs are written to `../trace/<num_channels>_channels_per_device/<mode>/<model>/`.
+The operator is part of the trace filename, for example `trace_1_FC_devices_seqlen_4096_op_qkv_proj.txt`, so traces of different operators do not overwrite each other.
+A non-default `--reuse_size` adds `_reuse<N>`, and `--inter-device-attention` adds `_ida` to model-parallel traces.
+Existing traces with a matching filename are reused, not regenerated.
+
 To try other PIM configurations, pass the arguments below to `run_sim.py` (defaults are defined in `utils.py`).
 
 ## Operators
@@ -73,19 +82,54 @@ Pass one of these to `--operator`:
 | Operator | Description |
 |---|---|
 | `all` | Full transformer block (original CENT behavior) |
-| `trace_rms` | RMSNorm |
+| `trace_rms` | RMSNorm (LayerNorm for OPT-66B) |
 | `trace_qkv_proj` | Q/K/V projection |
 | `trace_rope` | Rotary position embedding |
 | `trace_attn_score` | Attention score (QKᵀ) |
-| `trace_attn_mask` | Attention mask (Llama and Qwen3 models only, not OPT/ViT) |
+| `trace_attn_mask` | Attention mask |
 | `trace_attn_softmax` | Attention softmax |
 | `trace_attn_o` | Attention output (score × V) |
 | `trace_wo_proj` | Output projection |
-| `trace_router` | MoE router (Qwen3 MoE models) |
+| `trace_router` | MoE router |
 | `trace_w1_proj` | FFN W1 projection |
 | `trace_w3_proj` | FFN W3 projection |
 | `trace_ffn_af` | FFN activation function |
 | `trace_w2_proj` | FFN W2 projection |
+
+### Supported operators per model
+
+Each model is traced by one model class, and the class decides which operators exist.
+Llama2, Llama3.1, Qwen3 and ViT models use `TransformerBlockLlama3` (`Llama3_1.py`).
+OPT-66B uses `TransformerBlockGPT` (`GPT.py`), which has no RoPE, attention mask, router, W3 or separate activation operator.
+
+| Operator | Llama2-7B/13B/70B | Llama31-8B/70B | Qwen3-30B-A3B / 235B-A22B | ViT-B16/L16/H14 | OPT-66B |
+|---|:-:|:-:|:-:|:-:|:-:|
+| `all` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_rms` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_qkv_proj` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_rope` | ✓ | ✓ | ✓ | △ | ✗ |
+| `trace_attn_score` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_attn_mask` | ✓ | ✓ | ✓ | △ | ✗ |
+| `trace_attn_softmax` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_attn_o` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_wo_proj` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_router` | △ | △ | ✓ | △ | ✗ |
+| `trace_w1_proj` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `trace_w3_proj` | ✓ | ✓ | ✓ | ✓ | ✗ |
+| `trace_ffn_af` | ✓ | ✓ | ✓ | ✓ | ✗ |
+| `trace_w2_proj` | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+- ✓: supported.
+- △: the trace is generated, but the operator does not exist in the real model (no MoE router in dense models, no RoPE or causal mask in ViT). Do not use these results.
+- ✗: not implemented for this model. Trace generation fails.
+
+**Running an unsupported (✗) operator fails.** `function_sim.py` prints
+
+```
+Error: operator 'trace_rope' is not supported by TransformerBlockGPT. See the Operators table in README.md for the operators each model supports.
+```
+
+for every trace it is asked to generate. `run_sim.py` does not stop at this error: it keeps going and later crashes with an unrelated `ZeroDivisionError`, and no results are written. If you see that error, scroll up and look for the message above.
 
 ## `run_sim.py` Arguments
 
@@ -114,6 +158,13 @@ Pass one of these to `--operator`:
 | `--generate_trace_max_workers` | `20` | Maximum number of parallel trace-generation jobs. |
 | `--run_simulation_max_workers` | `4` | Maximum number of parallel Ramulator jobs. |
 
+**Note on `--num_channels`.** The trace generator maps a model onto `--num_channels` channels, but the rest of the pipeline assumes 32 channels per device: the Ramulator configuration (`GDDR6_AiM_org` in `aim_simulator`, used by `../aim_simulator/test/example.yaml`) has 32 channels, `cent_power_calculator.py` uses `CH_PER_DV = 32`, and `trace/compile.py` averages over 32 channels.
+With a value other than 32, for example 16, the traces are written to `16_channels_per_device/` and simulated on a 32-channel device, so the unused channels stay idle and are included in utilization and static power.
+All scripts in this repository use 32 channels.
+
+**Note on pipeline-parallel mode.** All Fengshui test scripts run with `--model_parallel`. Pipeline-parallel mode (without `--model_parallel`) is only used by the original CENT scripts and is less tested.
+In this mode, `--process_throughputs` leaves the `Total Transformer Latency (ms)`, `Static Power (W)` and `Dynamic Power (W)` columns of the processed CSV empty. The per-seqlen values of these columns are still in `simulation_results.csv`.
+
 ## Fengshui Test Scripts
 
 These scripts in the repository root generate the PIM data used in Fengshui. Each one cleans old traces, then runs `run_sim.py` over its operator list at several device counts.
@@ -139,7 +190,8 @@ bash test3.sh
 - `GPT.py` / `Llama.py`: the monolithic `trace_only()` transformer-block trace is split into per-operator trace methods (listed in [Operators](#operators)).
 - `function_sim.py`: new `--operator` argument dispatches to a single operator trace (`all` reproduces the original full-block behavior). Llama models now use `Llama3_1.py`, which adds GQA and MoE support.
 - `cent_power_calculator.py`: `power_calculator()` takes an `Operator` argument and includes RMSNorm/Softmax/RoPE latency and energy only for the selected operator. Power is normalized by total latency (PIM + accelerator). It prints a per-operator latency breakdown as CSV (`pim, RMS, SFT, ROT, Total Acc, Total, utilization`).
-- `utils.py`: model configs for the new models and the `--operator` CLI option.
+- `utils.py`: model configs for the new models and the `--operator` CLI option. Changed default `burst-length` from 16 to 32, in accordance with data format shift 
+from BF16 to INT8. 
 
 Where configurations live:
 

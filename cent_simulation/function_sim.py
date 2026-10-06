@@ -71,20 +71,34 @@ if __name__ == "__main__":
     #     TB.file.close()
 
 
+    # Not every model class implements every operator (e.g. TransformerBlockGPT
+    # for OPT-66B has no trace_rope / trace_attn_mask / trace_router /
+    # trace_w3_proj / trace_ffn_af). Missing operators map to a stub that fails
+    # with a clear message only when that operator is actually requested.
+    def unsupported_operator(name):
+        def fail():
+            raise SystemExit(f"Error: operator '{name}' is not supported by {type(TB).__name__}. "
+                             f"See the Operators table in README.md for the operators each model supports.")
+        return fail
+
+    def operator_trace(name):
+        method = getattr(TB, name, None)
+        return method if callable(method) else unsupported_operator(name)
+
     operator_map = {
-        "trace_rms": TB.trace_rms,
-        "trace_qkv_proj": TB.trace_qkv_proj,
-        "trace_rope": TB.trace_rope,
-        "trace_attn_score": TB.trace_attn_score,
-        "trace_attn_mask": TB.trace_attn_mask,
-        "trace_attn_softmax": TB.trace_attn_softmax,
-        "trace_attn_o": TB.trace_attn_o,
-        "trace_wo_proj": TB.trace_wo_proj,
-        "trace_router": TB.trace_router,
-        "trace_w1_proj": TB.trace_w1_proj,
-        "trace_w3_proj": TB.trace_w3_proj,
-        "trace_ffn_af": TB.trace_ffn_af,
-        "trace_w2_proj": TB.trace_w2_proj,
+        "trace_rms": operator_trace("trace_rms"),
+        "trace_qkv_proj": operator_trace("trace_qkv_proj"),
+        "trace_rope": operator_trace("trace_rope"),
+        "trace_attn_score": operator_trace("trace_attn_score"),
+        "trace_attn_mask": operator_trace("trace_attn_mask"),
+        "trace_attn_softmax": operator_trace("trace_attn_softmax"),
+        "trace_attn_o": operator_trace("trace_attn_o"),
+        "trace_wo_proj": operator_trace("trace_wo_proj"),
+        "trace_router": operator_trace("trace_router"),
+        "trace_w1_proj": operator_trace("trace_w1_proj"),
+        "trace_w3_proj": operator_trace("trace_w3_proj"),
+        "trace_ffn_af": operator_trace("trace_ffn_af"),
+        "trace_w2_proj": operator_trace("trace_w2_proj"),
     }
 
 
